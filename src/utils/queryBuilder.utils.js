@@ -1,0 +1,400 @@
+// Safe ISO-8601 date pattern — avoids over-eager Date.parse()
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(T[\d:.Z+-]*)?$/;
+
+const RESERVED_KEYS = new Set([
+  "page",
+  "limit",
+  "sort",
+  "fields",
+  "populate",
+  "populateLimit",
+  "populatePage",
+  "selectPopulate",
+  "action",
+]);
+
+const MAX_LIMIT = 500; // Hard cap — prevent runaway queries
+
+/** Escape all RegExp special characters in user input */
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+class QueryBuilder {
+  constructor(query, queryStr, schema) {
+    this.originalOptions = query.getOptions();
+    this.query = query;
+    this.queryStr = queryStr;
+    this.schema = schema;
+  }
+
+  // ─── Helpers ────────────────────────────────────────────────────────────────
+
+  isDateString(value) {
+    return ISO_DATE_RE.test(value) && !isNaN(Date.parse(value));
+  }
+
+  castValue(val) {
+    if (Array.isArray(val)) return val.map((v) => this.castValue(v));
+    if (typeof val !== "string") return val;
+    if (val === "") return val;
+    if (val === "true") return true;
+    if (val === "false") return false;
+    if (!isNaN(val)) return Number(val);
+    if (this.isDateString(val)) return new Date(val);
+    return val;
+  }
+
+  getFieldType(field) {
+    try {
+      return this.schema?.path(field)?.instance ?? "Mixed";
+    } catch {
+      return "Mixed";
+    }
+  }
+
+  /** Midnight UTC on the given date */
+  getStartOfDay(value) {
+    const d = new Date(value);
+    d.setUTCHours(0, 0, 0, 0);
+    return d;
+  }
+
+  /** 23:59:59.999 UTC on the given date */
+  getEndOfDay(value) {
+    const d = new Date(value);
+    d.setUTCHours(23, 59, 59, 999);
+    return d;
+  }
+
+  // ─── Condition builder ──────────────────────────────────────────────────────
+
+  /**
+ * Build a single MongoDB condition object.
+ * Handles all types — Number, Date, String, Boolean, Array, Nested.
+ */
+  buildCondition(field, operator, value) {
+    const fieldType = this.getFieldType(field);
+    const isDate = fieldType === "Date";
+
+    switch (operator) {
+      // ── Equality ────────────────────────────────────────────────────────────
+
+      case "eq": {
+        if (isDate) {
+          return {
+            [field]: {
+              $gte: this.getStartOfDay(value),
+              $lt: this.getEndOfDay(value), // exclusive next-day end
+            },
+          };
+        }
+        return { [field]: this.castValue(value) };
+      }
+
+      case "ne":
+        return { [field]: { $ne: this.castValue(value) } };
+
+      // ── Comparison ──────────────────────────────────────────────────────────
+      //
+      // Date semantics:
+      // gt → after end-of-day (strictly after the given day)
+      // gte → from start-of-day (includes the given day)
+      // lt → before start-of-day (strictly before the given day)
+      // lte → up to end-of-day (includes the given day)
+
+      case "gt":
+        return {
+          [field]: {
+            $gt: isDate ? this.getEndOfDay(value) : this.castValue(value),
+          },
+        };
+
+      case "gte":
+        return {
+          [field]: {
+            $gte: isDate ? this.getStartOfDay(value) : this.castValue(value),
+          },
+        };
+
+      case "lt":
+        return {
+          [field]: {
+            $lt: isDate ? this.getStartOfDay(value) : this.castValue(value),
+          },
+        };
+
+      case "lte":
+        return {
+          [field]: {
+            $lte: isDate ? this.getEndOfDay(value) : this.castValue(value),
+          },
+        };
+
+      // ── Range ───────────────────────────────────────────────────────────────
+
+      case "between": {
+        const commaIdx = value.indexOf(",");
+        if (commaIdx === -1) {
+          throw new Error(
+            `"between" operator requires "min,max" — no comma found in "${value}"`,
+          );
+        }
+        const min = value.slice(0, commaIdx);
+        const max = value.slice(commaIdx + 1);
+
+        if (isDate) {
+          return {
+            [field]: {
+              $gte: this.getStartOfDay(min),
+              $lte: this.getEndOfDay(max),
+            },
+          };
+        }
+
+        return {
+          [field]: {
+            $gte: this.castValue(min),
+            $lte: this.castValue(max),
+          },
+        };
+      }
+
+      // ── String ──────────────────────────────────────────────────────────────
+
+      case "contains":
+        return { [field]: { $regex: escapeRegex(value), $options: "i" } };
+
+      case "ncontains":
+        return {
+          [field]: { $not: { $regex: escapeRegex(value), $options: "i" } },
+        };
+
+      case "startsWith":
+        return { [field]: { $regex: `^${escapeRegex(value)}`, $options: "i" } };
+
+      case "endsWith":
+        return { [field]: { $regex: `${escapeRegex(value)}$`, $options: "i" } };
+
+      // ── Array ───────────────────────────────────────────────────────────────
+
+      case "in":
+        return { [field]: { $in: this.castValue(value.split(",")) } };
+
+      case "nin":
+        return { [field]: { $nin: this.castValue(value.split(",")) } };
+
+      case "all":
+        return { [field]: { $all: this.castValue(value.split(",")) } };
+
+      case "size": {
+        const size = parseInt(value, 10);
+        if (isNaN(size))
+          throw new Error(`"size" requires an integer, got "${value}"`);
+        return { [field]: { $size: size } };
+      }
+
+      // ── Nested / $elemMatch ─────────────────────────────────────────────────
+      //
+      // Format: ?arrayField__elemMatch=nestedKey:operator:value
+      // e.g. : ?items__elemMatch=status:eq:active
+      // ?items__elemMatch=price:gte:100
+
+      case "elemMatch": {
+        const { nestedKey, mongoOp, val } = this._parseElemMatch(value);
+        return {
+          [field]: { $elemMatch: { [nestedKey]: { [mongoOp]: val } } },
+        };
+      }
+
+      // "nElemMatch" → NO element matches the condition (was misnamed "elemMatchEntire")
+      case "nElemMatch": {
+        const { nestedKey, mongoOp, val } = this._parseElemMatch(value);
+        return {
+          [field]: {
+            $not: { $elemMatch: { [nestedKey]: { [mongoOp]: val } } },
+          },
+        };
+      }
+
+      default:
+        throw new Error(`Unsupported operator: "${operator}"`);
+    }
+  }
+
+  /**
+ * Parse "nestedKey:operator:value" used by elemMatch operators.
+ * Validates all three parts are present.
+ */
+  _parseElemMatch(raw) {
+    const parts = raw.split(":");
+    if (parts.length < 3) {
+      throw new Error(
+        `elemMatch value must be "nestedKey:operator:value", got "${raw}"`,
+      );
+    }
+
+    const [nestedKey, op, ...rest] = parts;
+    const nestedVal = rest.join(":"); // re-join in case value itself contains ":"
+
+    const mongoOperators = {
+      eq: "$eq",
+      ne: "$ne",
+      lt: "$lt",
+      lte: "$lte",
+      gt: "$gt",
+      gte: "$gte",
+      in: "$in",
+      nin: "$nin",
+    };
+
+    const mongoOp = mongoOperators[op];
+    if (!mongoOp) throw new Error(`Unknown elemMatch operator: "${op}"`);
+
+    return {
+      nestedKey,
+      mongoOp,
+      val: this.castValue(nestedVal),
+    };
+  }
+
+  // ─── Pipeline steps ─────────────────────────────────────────────────────────
+
+  filter() {
+    const mongoQuery = {};
+
+    for (const [key, value] of Object.entries(this.queryStr)) {
+      // Guard: skip reserved keys and block prototype-pollution attempts
+      if (RESERVED_KEYS.has(key)) continue;
+      if (
+        key.startsWith("__") ||
+        key === "constructor" ||
+        key === "prototype"
+      ) {
+        continue;
+      }
+
+      try {
+        // ── Parse field + operator ────────────────────────────────────────────
+        //
+        // Convention: field__operator (DOUBLE underscore)
+        // Examples : created_at__gte | price__between | name__contains
+        //
+        // If no "__" separator → treat the whole key as a field, infer operator
+        // from the schema type.
+
+        let field, operator;
+
+        const sepIdx = key.lastIndexOf("__");
+
+        if (sepIdx !== -1 && sepIdx !== 0) {
+          // e.g. "created_at__gte" → field="created_at" op="gte"
+          field = key.slice(0, sepIdx).replace(/\[(\d+)\]/g, ".$1");
+          operator = key.slice(sepIdx + 2);
+        } else {
+          // No separator — infer operator from schema type
+          field = key.replace(/\[(\d+)\]/g, ".$1");
+          operator = this._inferOperator(field);
+        }
+
+        // Convert dot-bracketed array notation: items[0] → items.0
+        field = field.replace(/\[(\d+)\]/g, ".$1");
+
+        const condition = this.buildCondition(field, operator, value);
+
+        // Merge conditions on the same field (e.g. gte + lte on "price")
+        for (const [f, v] of Object.entries(condition)) {
+          if (
+            mongoQuery[f] &&
+            typeof mongoQuery[f] === "object" &&
+            !Array.isArray(mongoQuery[f]) &&
+            typeof v === "object" &&
+            !Array.isArray(v)
+          ) {
+            mongoQuery[f] = { ...mongoQuery[f], ...v };
+          } else {
+            mongoQuery[f] = v;
+          }
+        }
+      } catch (err) {
+        // Surface bad query params as a validation error rather than a 500 crash
+        const error = new Error(
+          `Invalid filter param "${key}": ${err.message}`,
+        );
+        error.status = 400;
+        throw error;
+      }
+    }
+
+    this.query = this.query.find(mongoQuery);
+    this.query.setOptions({ ...this.originalOptions });
+    return this;
+  }
+
+  /** Infer a sensible default operator based on the schema field type. */
+  _inferOperator(field) {
+    const type = this.getFieldType(field);
+    if (type === "Array") return "in";
+    return "eq"; // works for Number, Date, Boolean, String, ObjectId, Mixed
+  }
+
+  sort() {
+    if (this.queryStr.sort) {
+      const sortStr = this.queryStr.sort.split(",").join(" ");
+      this.query = this.query.sort(sortStr);
+    }
+    return this;
+  }
+
+  fields() {
+    if (this.queryStr.fields) {
+      const fieldStr = this.queryStr.fields.split(",").join(" ");
+      this.query = this.query.select(fieldStr);
+    }
+    return this;
+  }
+
+  pagination() {
+    const page = Math.max(1, parseInt(this.queryStr.page, 10) || 1);
+    const limit = Math.min(
+      Math.max(1, parseInt(this.queryStr.limit, 10) || 100),
+      MAX_LIMIT, // hard cap — prevents runaway queries
+    );
+    const skip = (page - 1) * limit;
+
+    this.query = this.query.skip(skip).limit(limit);
+    return this;
+  }
+
+  populate() {
+    if (!this.queryStr.populate) return this;
+
+    const page = Math.max(1, parseInt(this.queryStr.populatePage, 10) || 1);
+    const limit = Math.min(
+      Math.max(1, parseInt(this.queryStr.populateLimit, 10) || 10),
+      MAX_LIMIT,
+    );
+    const skip = (page - 1) * limit;
+    const select = this.queryStr.selectPopulate?.split(",").join(" ") || "-__v";
+
+    // Mongoose object-form populate does NOT accept space-separated paths —
+    // build one populate call per path instead.
+    const paths = this.queryStr.populate
+      .split(",")
+      .map((p) => p.trim())
+      .filter(Boolean);
+
+    for (const path of paths) {
+      this.query = this.query.populate({
+        path,
+        select,
+        options: { limit, skip, ...this.originalOptions },
+        strictPopulate: false,
+      });
+    }
+
+    return this;
+  }
+}
+
+export default QueryBuilder;

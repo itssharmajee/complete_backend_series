@@ -1,14 +1,12 @@
 import { app } from "./src/app.js";
 import { appConfig } from "./src/config/app.config.js";
 import { dbConnection } from "./src/config/database.config.js";
-import { connectRedis } from "./src/config/redis.config.js";
-import logger from "./src/utils/logger.js";
-// dotenv.config({ path: ['.env.local', '.env'],debug:true })
+import { logger } from "./src/config/logger.config.js";
 
 const PORT = appConfig.app.port;
 
 // 🔹 Log environment
-logger.info(`Environment: ${process.env.NODE_ENV || "development"}`);
+logger.info(`Environment: ${appConfig.app.env || "development"}`);
 
 // 🔹 App lifecycle (mostly useful for sub-apps)
 app.on("mount", () => {
@@ -21,9 +19,9 @@ const startServer = async () => {
         // ✅ Connect DB
         await dbConnection();
         logger.info("Database connected successfully");
-        await connectRedis();
+        // await connectRedis();
         // ✅ Start server
-        const server = app.listen(PORT, () => {
+        app.listen(PORT, () => {
             logger.info(`Server is listening on port ${PORT}`);
         });
 
