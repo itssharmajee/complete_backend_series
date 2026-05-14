@@ -1,27 +1,26 @@
 import mongoose from "mongoose"
 import { appConfig } from "./app.config.js";
+import { logger } from "./logger.config.js";
 
 const dbConnection = async () => {
     try {
 
         await mongoose.connect(appConfig.database.uri);
-        console.log("Database connected Successfully");
-
         mongoose.connection.on('connected', () => {
-            console.log('Mongoose connected to DB');
+            logger.info(`Database: connected Successfully`);
         });
 
         mongoose.connection.on('error', (err) => {
-            console.error('Mongoose connection error:', err);
+            logger.error("Database failed", err);
         });
 
         mongoose.connection.on('disconnected', () => {
-            console.warn('Mongoose disconnected from DB');
+            logger.warn('Mongoose disconnected from DB');
         });
 
     } catch (error) {
-        console.log("error in database", error);
+        logger.error("Database failed", err);
         process.exit(1);
     }
 }
-export  {dbConnection}
+export { dbConnection }

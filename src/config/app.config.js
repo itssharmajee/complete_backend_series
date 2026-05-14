@@ -73,7 +73,7 @@ export const appConfig = {
         retryDelay: 5000,
         maxRetriesPerRequest: null,
     },
-
+    
     bullMQ: {
         removeOnComplete: 1000,
         removeOnFail: 5000,

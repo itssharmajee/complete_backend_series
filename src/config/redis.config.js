@@ -1,16 +1,15 @@
+// config/redis.config.js
 import IORedis from "ioredis";
 import { appConfig } from "./app.config.js";
+import { logger } from "./logger.config.js";
 
 export const bullConnection = new IORedis({
-  host: appConfig.redis.host,
-  port: appConfig.redis.port,
+  host: appConfig.redis.host || "127.0.0.1",
+  port: appConfig.redis.port || 6379,
   password: appConfig.redis.password || undefined,
-  db: appConfig.redis.db,
+  db: appConfig.redis.db ?? 0,
 
-  // Required for BullMQ
   maxRetriesPerRequest: null,
-
-  // Production settings
   enableReadyCheck: true,
   lazyConnect: true,
 
@@ -19,62 +18,27 @@ export const bullConnection = new IORedis({
   },
 
   reconnectOnError(err) {
-    const targetErrors = [
-      "READONLY",
-      "ETIMEDOUT",
-      "ECONNRESET",
-      "EPIPE",
-    ];
-
-    return targetErrors.some((error) =>
-      err.message.includes(error)
-    );
+    const targetErrors = ["READONLY", "ETIMEDOUT", "ECONNRESET", "EPIPE"];
+    return targetErrors.some((code) => err.message.includes(code));
   },
 });
 
-
-// Redis Events
-
-
 bullConnection.on("connect", () => {
-  console.log("✅ Redis connecting...");
+  logger.info("Redis connecting...");
 });
 
 bullConnection.on("ready", () => {
-  console.log("✅ Redis connected");
+  logger.info("Redis connected");
 });
 
 bullConnection.on("error", (err) => {
-  console.error("❌ Redis error:", err.message);
+  logger.error(`Redis error: ${err.message}`);
 });
 
 bullConnection.on("close", () => {
-  console.warn("⚠️ Redis connection closed");
+  logger.warn("Redis connection closed");
 });
 
 bullConnection.on("reconnecting", () => {
-  console.warn("🔄 Redis reconnecting...");
+  logger.warn("Redis reconnecting...");
 });
-
-
-// Graceful Shutdown
-
-
-const shutdown = async (signal) => {
-  try {
-    console.log(`🛑 Received ${signal}. Closing Redis connection...`);
-
-    await bullConnection.quit();
-
-    console.log("✅ Redis connection closed gracefully");
-
-    process.exit(0);
-  } catch (error) {
-    console.error("❌ Error while closing Redis:", error.message);
-
-    process.exit(1);
-  }
-};
-
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
