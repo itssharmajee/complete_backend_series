@@ -17,10 +17,10 @@ const startServer = async () => {
         await dbConnection();
         logger.info("Database connected successfully");
 
-        await bullConnection.connect();
-        logger.info("Redis connected successfully");
+        // await bullConnection.connect();
+        // logger.info("Redis connected successfully");
 
-        await seedPermissions();
+        // await seedPermissions();
 
         server = app.listen(PORT, () => {
             logger.info(`Server running on port ${PORT}`);

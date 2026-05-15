@@ -19,6 +19,11 @@ app.get('/health', (req, res) => {
     res.status(200).json(new APIResponse(200, {}, "Server is running...."));
 })
 
+app.use((err, req, res, next) => {
+    console.log("[URL: ", req.url);
+    next()
+})
+
 // Routes
 app.use(appConfig.app.apiPrefix, mainRouter);
 
